@@ -33,18 +33,25 @@ license='MIT'
 
 """
 
-__version__ = "0.0.0+auto.0"
+__version__ = "1.14.1"
 __repo__ = "https://github.com/adafruit/Adafruit_CircuitPython_Requests.git"
 
 import errno
 import sys
+import binascii
 
 import json as json_module
 
-if not sys.implementation.name == "circuitpython":
+if sys.implementation.name == "circuitpython":
+
+    def cast(_t, value):
+        """No-op shim for the typing.cast() function which is not available in CircuitPython."""
+        return value
+
+else:
     from ssl import SSLContext
     from types import ModuleType, TracebackType
-    from typing import Any, Dict, Optional, Tuple, Type, Union
+    from typing import Any, Dict, Optional, Tuple, Type, Union, cast
 
     try:
         from typing import Protocol
@@ -76,6 +83,14 @@ if not sys.implementation.name == "circuitpython":
             """Connect to a remote socket at the provided (host, port) address. The conntype
             kwarg optionally may indicate SSL or not, depending on the underlying interface.
             """
+
+    class LegacyCircuitPythonSocketType(CommonCircuitPythonSocketType, Protocol):
+        """Describes the structure a legacy CircuitPython socket type must have."""
+
+        def recv(self, bufsize: int = ...) -> bytes:
+            """Receive data from the socket. The return value is a bytes object representing
+            the data received. The maximum amount of data to be received at once is specified
+            by bufsize."""
 
     class SupportsRecvWithFlags(Protocol):
         """Describes a type that posseses a socket recv() method supporting the flags kwarg."""
@@ -114,6 +129,7 @@ if not sys.implementation.name == "circuitpython":
             """Connect to a remote socket at the provided address."""
 
     SocketType = Union[
+        LegacyCircuitPythonSocketType,
         CircuitPythonSocketType,
         StandardPythonSocketType,
     ]
@@ -173,6 +189,8 @@ class Response:
         self._remaining = None
         self._chunked = False
 
+        self._backwards_compatible = not hasattr(sock, "recv_into")
+
         http = self._readto(b" ")
         if not http:
             if session:
@@ -200,7 +218,13 @@ class Response:
         self.close()
 
     def _recv_into(self, buf: bytearray, size: int = 0) -> int:
-        return self.socket.recv_into(buf, size)
+        if self._backwards_compatible:
+            size = len(buf) if size == 0 else size
+            b = self.socket.recv(size)
+            read_size = len(b)
+            buf[:read_size] = b
+            return read_size
+        return cast("SupportsRecvInto", self.socket).recv_into(buf, size)
 
     def _readto(self, stop: bytes) -> bytearray:
         buf = self._receive_buffer
@@ -324,6 +348,17 @@ class Response:
         else:
             self.socket.close()
         self.socket = None
+    
+    def _remove_non_ascii_unicode(self, content: bytes) -> str:
+        try:
+            rcontent = str(content, "utf-8")
+        except UnicodeError:
+            contentstr = bytes(len(content))
+            for i in content:
+                if i < 128:
+                    contentstr += bytes([i])
+            rcontent = str(contentstr, "utf-8")
+        return rcontent
 
     def _parse_headers(self) -> None:
         """
@@ -338,7 +373,7 @@ class Response:
             if title and content:
                 # enforce that all headers are lowercase
                 title = str(title, "utf-8").lower()
-                content = str(content, "utf-8")
+                content = self._remove_non_ascii_unicode(content)
                 if title == "content-length":
                     self._remaining = int(content)
                 if title == "transfer-encoding":
@@ -740,7 +775,6 @@ class _FakeSSLSocket:
         self.send = socket.send
         self.recv = socket.recv
         self.close = socket.close
-        self.recv_into = socket.recv_into
 
     def connect(self, address: Tuple[str, int]) -> None:
         """connect wrapper to add non-standard mode parameter"""
